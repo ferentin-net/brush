@@ -181,9 +181,13 @@ impl<R: std::io::BufRead> Parser<R> {
         &mut self,
     ) -> Result<ast::FunctionBody, crate::error::ParseError> {
         let tokens = self.tokenize()?;
-        let parse_result =
-            peg::token_parser::function_parens_and_body(&Tokens { tokens: &tokens }, &self.options);
-        parse_result_to_error(parse_result, &tokens)
+        let nesting = peg::NestingTracker::new();
+        let parse_result = peg::token_parser::function_parens_and_body(
+            &Tokens { tokens: &tokens },
+            &self.options,
+            &nesting,
+        );
+        parse_result_to_error(parse_result, &tokens, &nesting)
     }
 
     fn tokenize(&mut self) -> Result<Vec<Token>, crate::error::ParseError> {
@@ -231,13 +235,15 @@ pub fn parse_tokens(
     tokens: &[Token],
     options: &ParserOptions,
 ) -> Result<ast::Program, crate::error::ParseError> {
-    let parse_result = peg::token_parser::program(&Tokens { tokens }, options);
-    parse_result_to_error(parse_result, tokens)
+    let nesting = peg::NestingTracker::new();
+    let parse_result = peg::token_parser::program(&Tokens { tokens }, options, &nesting);
+    parse_result_to_error(parse_result, tokens, &nesting)
 }
 
 fn parse_result_to_error<R>(
     parse_result: Result<R, ::peg::error::ParseError<usize>>,
     tokens: &[Token],
+    nesting: &peg::NestingTracker,
 ) -> Result<R, crate::error::ParseError>
 where
     R: std::fmt::Debug,
@@ -249,7 +255,11 @@ where
         }
         Err(parse_error) => {
             tracing::debug!(target: "parse", "Parse error: {:?}", parse_error);
-            Err(crate::error::convert_peg_parse_error(&parse_error, tokens))
+            Err(crate::error::convert_peg_parse_error(
+                &parse_error,
+                tokens,
+                nesting,
+            ))
         }
     }
 }

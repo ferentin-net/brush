@@ -175,6 +175,19 @@ fn parse_extended_test_not() -> Result<()> {
     Ok(())
 }
 
+// N.B. A run of negations is matched iteratively rather than recursively; this
+// pins the tree it builds to the one the recursive form built.
+#[test]
+fn parse_extended_test_repeated_not() -> Result<()> {
+    let input = "[[ ! ! ! -f file ]]";
+    let result = test_with_snapshot(input)?;
+    assert_snapshot_redacted!(ParseResult {
+        input,
+        result: &result
+    });
+    Ok(())
+}
+
 #[test]
 fn parse_extended_test_parenthesized() -> Result<()> {
     let input = "[[ ( -f file ) ]]";
