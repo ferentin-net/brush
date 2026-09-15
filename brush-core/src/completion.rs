@@ -1,6 +1,7 @@
 //! Implements programmable command completion support.
 
 use clap::ValueEnum;
+use itertools::Itertools;
 use std::{
     borrow::Cow,
     collections::HashMap,
@@ -314,11 +315,11 @@ impl Spec {
                 shell, &params, word_list, &options,
             )
             .await?;
-            for word in words {
-                if word.starts_with(context.token_to_complete) {
-                    candidates.push(word);
-                }
-            }
+            candidates.extend(
+                words
+                    .into_iter()
+                    .filter(|word| word.starts_with(context.token_to_complete)),
+            );
         }
 
         if let Some(glob_pattern) = &self.glob_pattern {
@@ -334,9 +335,7 @@ impl Spec {
                 )?
                 .into_paths();
 
-            for expansion in expansions {
-                candidates.push(expansion);
-            }
+            candidates.extend(expansions);
         }
         if let Some(function_name) = &self.function_name {
             let call_result = self
@@ -409,14 +408,21 @@ impl Spec {
             no_trailing_space_at_end_of_line: options.no_space,
         };
 
-        if options.plus_dirs || options.dir_names {
-            // Also add dir name completion.
+        // plusdirs always adds directory names; dirnames only does so when nothing else matched.
+        if options.plus_dirs || (options.dir_names && candidates.is_empty()) {
             let mut dir_candidates = get_file_completions(
                 shell,
                 context.token_to_complete,
                 /* must_be_dir */ true,
             )
             .await;
+
+            // If directories are all we have, let them be marked as such.
+            if candidates.is_empty() && shell.completion_config().fallback_options.mark_directories
+            {
+                processing_options.treat_as_filenames = true;
+            }
+
             candidates.append(&mut dir_candidates);
         }
 
@@ -466,7 +472,8 @@ impl Spec {
         for action in &self.actions {
             match action {
                 CompleteAction::Alias => {
-                    for name in shell.aliases().keys() {
+                    // Aliases are stored unordered; bash enumerates them sorted by name.
+                    for name in shell.aliases().keys().sorted() {
                         if name.starts_with(token) {
                             candidates.push(name.clone());
                         }
@@ -508,8 +515,11 @@ impl Spec {
                             candidates.push(keyword.to_string());
                         }
                     }
-                    for (name, _) in shell.funcs().iter() {
-                        candidates.push(name.to_owned());
+                    // Functions are stored unordered; bash enumerates them sorted by name.
+                    for (name, _) in shell.funcs().iter().sorted_by_key(|v| v.0) {
+                        if name.starts_with(token) {
+                            candidates.push(name.to_owned());
+                        }
                     }
                 }
                 CompleteAction::Directory => {
@@ -544,7 +554,8 @@ impl Spec {
                     candidates.append(&mut file_completions);
                 }
                 CompleteAction::Function => {
-                    for (name, _) in shell.funcs().iter() {
+                    // Functions are stored unordered; bash enumerates them sorted by name.
+                    for (name, _) in shell.funcs().iter().sorted_by_key(|v| v.0) {
                         candidates.push(name.to_owned());
                     }
                 }
@@ -772,7 +783,8 @@ impl Spec {
         let params = shell.default_exec_params();
         let invoke_result = shell
             .invoke_function(function_name, args.iter(), params)
-            .await;
+            .await
+            .map(|result| u8::from(result.exit_code));
 
         tracing::debug!(target: trace_categories::COMPLETION, "[completion function '{function_name}' returned: {invoke_result:?}]");
 

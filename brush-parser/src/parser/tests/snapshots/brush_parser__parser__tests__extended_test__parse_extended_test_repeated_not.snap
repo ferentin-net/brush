@@ -1,5 +1,6 @@
 ---
 source: brush-parser/src/parser/tests/extended_test.rs
+assertion_line: 184
 expression: "ParseResult { input, result: &result }"
 ---
 ParseResult(
@@ -10,13 +11,13 @@ ParseResult(
         CompoundListItem(AndOrList(
           first: Pipeline(
             seq: [
-              ExtendedTest(ExtendedTestExprCommand(
+              Compound(ExtendedTest(ExtendedTestExprCommand(
                 expr: Not(Not(Not(UnaryTest(FileExistsAndIsRegularFile, Word(
                   value: "file",
                   loc: "[location]",
                 ))))),
                 loc: "[location]",
-              ), None),
+              )), None),
             ],
           ),
         ), Sequence),
