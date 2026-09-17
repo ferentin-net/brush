@@ -89,6 +89,7 @@ jobs:
         if: github.event_name != 'release'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          retention-days: 7
           name: brush-docs
           path: |
             brush-docs.tar.gz
@@ -198,5 +199,6 @@ jobs:
         if: github.event_name != 'release' || matrix.force_dry_run
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          retention-days: 7
           name: brush-${{ matrix.target }}
           path: "${{ steps.upload-release.outputs.archive }}.*"
