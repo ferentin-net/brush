@@ -240,6 +240,7 @@ jobs:
         if: ${{ !matrix.check_only }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          retention-days: 7
           name: binaries-${{ matrix.arch }}-${{ matrix.os }}
           path: target/${{ matrix.target }}/release/${{ matrix.binary_name }}
 
@@ -247,6 +248,7 @@ jobs:
         if: ${{ matrix.target == '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          retention-days: 7
           name: integration-tests-${{ matrix.arch }}-${{ matrix.os }}
           path: |
             target/${{ matrix.target }}/release/deps/brush_*_tests-*
@@ -393,6 +395,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
+          retention-days: 7
           name: test-reports${{ matrix.artifact_suffix }}
           path: test-results-*.xml
 
@@ -414,6 +417,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
+          retention-days: 7
           name: codecov-reports${{ matrix.artifact_suffix }}
           path: code-coverage-results.md
 
@@ -551,6 +555,7 @@ jobs:
       - name: Upload test report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          retention-days: 7
           name: test-reports-public-api
           path: reports/*.md
 
@@ -601,6 +606,7 @@ jobs:
       - name: Upload performance results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          retention-days: 7
           name: perf-reports
           path: |
             pr/benchmarks.txt
@@ -668,6 +674,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          retention-days: 7
           name: test-reports-e2e
           path: test-results-e2e.md
 
