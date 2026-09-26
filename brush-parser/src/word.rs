@@ -852,6 +852,7 @@ peg::parser! {
             "(" {}
 
         // This rule matches an arithmetic word followed by a right parenthesis. It must consume the right parenthesis.
+        #[cache]
         rule arithmetic_word_plus_right_paren() =
             arithmetic_word(<[')']>) ")"
 
@@ -938,12 +939,24 @@ peg::parser! {
 
         rule is_true(value: bool) = &[_] {? if value { Ok(()) } else { Err("not true") } }
 
+        #[cache]
         rule extglob_pattern() =
             ("@" / "!" / "?" / "+" / "*") "(" extglob_body_piece()* ")" {}
 
         rule extglob_body_piece() =
             word_piece(<[')']>, true /*in_command*/) {}
 
+        // `#[cache]` on this, `extglob_pattern` and
+        // `arithmetic_word_plus_right_paren` (ferentin-net/ferentin-endpoint#820).
+        // Each is tried at every `(` in a command substitution or arithmetic
+        // expression, and when it fails the `(` is taken as literal text and the
+        // next one is tried again from scratch. Unmemoized, n unmatched `(` cost
+        // about 2^n (4^n for `@(`): `$(cat <<EOF` + 23 `(` took a second, and a
+        // heredoc body is opaque to the tokenizer, so nothing upstream stops it.
+        // Memoized by position, each is decided once. What remains is
+        // quadratic, since a failing one still scans its body to the end: about
+        // 2 s for 8,000 levels of `@(` in release.
+        #[cache]
         rule subshell_command() =
             "(" command() ")" {}
 
@@ -1294,6 +1307,30 @@ mod tests {
             input: word,
             result: parsed,
         })
+    }
+
+    /// Unmatched `(` in a command substitution or arithmetic expression cost
+    /// time exponential in their number before the paren rules were memoized
+    /// (ferentin-net/ferentin-endpoint#820). At 64 each of these would not have
+    /// returned; memoized, each takes well under a millisecond in release.
+    #[test]
+    fn unmatched_parens_are_parsed_in_polynomial_time() {
+        let n = 64;
+        let words = [
+            format!("$(cat <<EOF\n{}\nEOF\n)", "(".repeat(n)),
+            format!("$({})", "(".repeat(n)),
+            format!("$(ls {})", "@(".repeat(n)),
+            format!("$(({}1))", "(".repeat(n)),
+        ];
+        let started = std::time::Instant::now();
+        for word in &words {
+            let _ = super::parse(word, &ParserOptions::default());
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
