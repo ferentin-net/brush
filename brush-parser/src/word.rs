@@ -876,12 +876,14 @@ peg::parser! {
             // Finally, match unquoted literal text.
             unquoted_literal_text(<stop_condition()>, in_command)
 
+        #[cache]
         rule dollar_sign_word_piece() -> WordPiece =
             arithmetic_expansion() /
             legacy_arithmetic_expansion() /
             command_substitution() /
             parameter_expansion()
 
+        #[cache]
         rule double_quoted_word_piece() -> WordPiece =
             arithmetic_expansion() /
             legacy_arithmetic_expansion() /
@@ -890,9 +892,11 @@ peg::parser! {
             double_quoted_escape_sequence() /
             double_quoted_text()
 
+        #[cache]
         rule double_quoted_sequence() -> Vec<WordPieceWithSource> =
             "\"" i:double_quoted_sequence_inner()* "\"" { i }
 
+        #[cache]
         rule gettext_double_quoted_sequence() -> Vec<WordPieceWithSource> =
             "$\"" i:double_quoted_sequence_inner()* "\"" { i }
 
@@ -946,16 +950,24 @@ peg::parser! {
         rule extglob_body_piece() =
             word_piece(<[')']>, true /*in_command*/) {}
 
-        // `#[cache]` on this, `extglob_pattern` and
-        // `arithmetic_word_plus_right_paren` (ferentin-net/ferentin-endpoint#820).
-        // Each is tried at every `(` in a command substitution or arithmetic
-        // expression, and when it fails the `(` is taken as literal text and the
-        // next one is tried again from scratch. Unmemoized, n unmatched `(` cost
-        // about 2^n (4^n for `@(`): `$(cat <<EOF` + 23 `(` took a second, and a
-        // heredoc body is opaque to the tokenizer, so nothing upstream stops it.
-        // Memoized by position, each is decided once. What remains is
-        // quadratic, since a failing one still scans its body to the end: about
-        // 2 s for 8,000 levels of `@(` in release.
+        // `#[cache]` here and on every rule an opener is tried through before a
+        // literal fallback (ferentin-net/ferentin-endpoint#820): this,
+        // `extglob_pattern`, `arithmetic_word_plus_right_paren`,
+        // `dollar_sign_word_piece`, `double_quoted_word_piece`, both quoted
+        // sequences, `parameter_expansion`, `command_substitution`, both
+        // arithmetic expansions and `parameter_expression_word`.
+        //
+        // Each is tried at an opener, and when it fails the opener is taken as
+        // literal text and the next one is tried again from scratch, so n
+        // unmatched openers cost about 2^n (3^n for `@(`, and worse for `$((`).
+        // A heredoc body is opaque to the tokenizer, so `$(cat <<EOF` and 23
+        // `(` took a second and nothing upstream stopped it. Memoized by
+        // position, each is decided once. Every one takes no arguments, and its
+        // result depends only on the position and the grammar's options.
+        //
+        // What remains is QUADRATIC, since a failing opener still scans its body
+        // to the end: in release, 4,000 levels of `$((` take about 4 s. A caller
+        // parsing untrusted words has to bound the openers per word itself.
         #[cache]
         rule subshell_command() =
             "(" command() ")" {}
@@ -1035,6 +1047,7 @@ peg::parser! {
 
         // TODO(parser): Deal with fact that there may be a quoted word or escaped closing brace chars.
         // TODO(parser): Improve on how we handle a '$' not followed by a valid variable name or parameter.
+        #[cache]
         rule parameter_expansion() -> WordPiece =
             "${" e:parameter_expression() "}" {
                 WordPiece::ParameterExpansion(e)
@@ -1184,6 +1197,7 @@ peg::parser! {
         rule variable_name() -> &'input str =
             $(!['0'..='9'] ['_' | '0'..='9' | 'a'..='z' | 'A'..='Z']+)
 
+        #[cache]
         pub(crate) rule command_substitution() -> WordPiece =
             "$(" c:command() ")" { WordPiece::CommandSubstitution(c.to_owned()) } /
             "`" c:backquoted_command() "`" { WordPiece::BackquotedCommandSubstitution(c) }
@@ -1204,9 +1218,11 @@ peg::parser! {
             "\\\\" { "\\\\" } /
             s:$([^'`']) { s }
 
+        #[cache]
         rule arithmetic_expansion() -> WordPiece =
             "$((" e:$(arithmetic_word(<"))">)) "))" { WordPiece::ArithmeticExpression(ast::UnexpandedArithmeticExpr { value: e.to_owned() } ) }
 
+        #[cache]
         rule legacy_arithmetic_expansion() -> WordPiece =
             "$[" e:$(arithmetic_word(<"]">)) "]" { WordPiece::ArithmeticExpression(ast::UnexpandedArithmeticExpr { value: e.to_owned() } ) }
 
@@ -1222,6 +1238,7 @@ peg::parser! {
         rule parameter_search_pattern() -> String =
             s:$(word(<['}' | '/']>)) { s.to_owned() }
 
+        #[cache]
         rule parameter_expression_word() -> String =
             s:$(word(<['}']>)) { s.to_owned() }
 
@@ -1309,27 +1326,48 @@ mod tests {
         })
     }
 
-    /// Unmatched `(` in a command substitution or arithmetic expression cost
-    /// time exponential in their number before the paren rules were memoized
+    /// Unmatched openers cost time exponential in their number before the
+    /// rules they are tried through were memoized
     /// (ferentin-net/ferentin-endpoint#820). At 64 each of these would not have
-    /// returned; memoized, each takes well under a millisecond in release.
+    /// returned; memoized, each takes a few milliseconds in release. Most sit
+    /// in a heredoc inside `$(…)`, because that is how they reach this parser
+    /// past the tokenizer.
     #[test]
-    fn unmatched_parens_are_parsed_in_polynomial_time() {
+    fn unmatched_openers_are_parsed_in_polynomial_time() {
         let n = 64;
+        let heredoc = |body: String| format!("$(cat <<EOF\n{body}\nEOF\n)");
         let words = [
-            format!("$(cat <<EOF\n{}\nEOF\n)", "(".repeat(n)),
+            heredoc("(".repeat(n)),
             format!("$({})", "(".repeat(n)),
             format!("$(ls {})", "@(".repeat(n)),
             format!("$(({}1))", "(".repeat(n)),
+            heredoc("${x-".repeat(n)),
+            heredoc("$((".repeat(n)),
+            heredoc("$[".repeat(n)),
+            heredoc("$(".repeat(n)),
+            heredoc("\"$(".repeat(n)),
+            heredoc("$\"$(".repeat(n)),
+            heredoc("${x-$((\"$(@(".repeat(n)),
+            format!("\"{}\"", "${x-\"".repeat(n)),
         ];
-        let started = std::time::Instant::now();
-        for word in &words {
-            let _ = super::parse(word, &ParserOptions::default());
-        }
+        // On a stack of its own: this grammar's DEPTH is unbounded too, and a
+        // debug build's frames overflow the 2 MiB test thread on the mixed
+        // shape. Depth is the caller's to bound; this test is about time.
+        let elapsed = std::thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                for word in &words {
+                    let _ = super::parse(word, &ParserOptions::default());
+                }
+                started.elapsed()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "took {:?}",
-            started.elapsed()
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}"
         );
     }
 
