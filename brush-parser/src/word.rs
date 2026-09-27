@@ -531,7 +531,12 @@ pub enum BraceExpressionMember {
 // parameter-expression alternative, and a caller that re-reads a word's parts
 // pays again each time. A deadline bounds all of them at once, because every
 // loop and every recursion in this grammar passes through one of the rules that
-// check it.
+// check it: `word_piece`, `arithmetic_word_piece`, `unquoted_literal_text_piece`,
+// `parameter`, `array_element_name`, `heredoc_word_piece`, `backquoted_char`
+// and `brace_expr`. What runs between two checks is a linear scan.
+//
+// It does not cover the tokenizer or the program grammar, which run before or
+// around this one and are bounded by the caller's own limits on their input.
 //
 // Per thread, and unarmed by default, so a caller that never sets one gets the
 // grammar exactly as it was. Once the deadline passes every checking rule
@@ -868,7 +873,7 @@ peg::parser! {
 
         // Parses a complete brace expression, with no prefix or suffix.
         pub(crate) rule brace_expr() -> BraceExpression =
-            "{" inner:brace_expr_inner() "}" { inner }
+            in_time() "{" inner:brace_expr_inner() "}" { inner }
 
         // Parses the text inside a complete brace expression; basically the complete brace
         // expression without the opening and closing brace characters.
@@ -1091,7 +1096,7 @@ peg::parser! {
         //
         // What remains is QUADRATIC, since a failing opener still scans its body
         // to the end: in release, 4,000 levels of `$((` take about 4 s. A caller
-        // parsing untrusted words has to bound the openers per word itself.
+        // parsing untrusted words should arm `set_parse_deadline`.
         #[cache]
         rule subshell_command() =
             "(" command() ")" {}
@@ -1532,6 +1537,37 @@ mod tests {
         });
     }
 
+    /// The program grammar reaches this one through its assignment check, on
+    /// every word, before a caller sees the word: an array subscript is parsed
+    /// as arithmetic. Armed on its own, so it is not handed a spent deadline.
+    #[test]
+    fn the_assignment_path_returns_near_the_deadline() {
+        let word = format!("x[$(cat <<EOF\n{}1\nEOF\n)", "$((".repeat(4_000));
+        let (elapsed, expired) = on_own_thread(move || {
+            let started = std::time::Instant::now();
+            super::set_parse_deadline(Some(started + std::time::Duration::from_millis(50)));
+            let _ = super::parse_scalar_assignment(&word, &ParserOptions::default());
+            (started.elapsed(), super::parse_deadline_expired())
+        });
+        assert!(expired, "{elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    /// Brace expansion recurses too, and `!brace_expr()` recomputes each level,
+    /// so unmatched `{` cost about 2^n. Guarded like the rest.
+    #[test]
+    fn unmatched_braces_return_near_the_deadline() {
+        let word = "{a,".repeat(4_000);
+        let (elapsed, expired) = on_own_thread(move || {
+            let started = std::time::Instant::now();
+            super::set_parse_deadline(Some(started + std::time::Duration::from_millis(50)));
+            let _ = super::parse_brace_expansions(&word, &ParserOptions::default());
+            (started.elapsed(), super::parse_deadline_expired())
+        });
+        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+        let _ = expired;
+    }
+
     /// A result cut short by the deadline is never cached for a later caller,
     /// armed or not.
     #[test]
@@ -1567,7 +1603,6 @@ mod tests {
                 let started = std::time::Instant::now();
                 super::set_parse_deadline(Some(started + std::time::Duration::from_millis(50)));
                 let _ = super::parse(&word, &ParserOptions::default());
-                let _ = super::parse_scalar_assignment(&word, &ParserOptions::default());
                 (started.elapsed(), super::parse_deadline_expired())
             });
             assert!(expired, "{elapsed:?}");
