@@ -521,6 +521,71 @@ pub enum BraceExpressionMember {
     Child(Vec<BraceExpressionOrText>),
 }
 
+// A deadline on the word grammar, for callers parsing untrusted words
+// (ferentin-net/ferentin-endpoint#820).
+//
+// Memoizing the rules an opener is tried through took the cost of n unmatched
+// openers from exponential to quadratic, but the grammar is reached from more
+// places than a caller can count openers at: the token grammar's assignment
+// check runs it on every word, `${x[a[a[` re-parses its subscript in every
+// parameter-expression alternative, and a caller that re-reads a word's parts
+// pays again each time. A deadline bounds all of them at once, because every
+// loop and every recursion in this grammar passes through one of the rules that
+// check it.
+//
+// Per thread, and unarmed by default, so a caller that never sets one gets the
+// grammar exactly as it was. Once the deadline passes every checking rule
+// fails, which unwinds the parse in time linear in its depth; the parse then
+// returns an error or, where a failed alternative falls back to text, a result
+// that may be wrong. So a caller that arms one must check
+// `parse_deadline_expired` after it is done, and treat anything produced once
+// it is true as unread.
+thread_local! {
+    static PARSE_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    static PARSE_DEADLINE_EXPIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PARSE_DEADLINE_TICKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Arms (or, with `None`, disarms) a deadline for word parsing on this thread,
+/// and clears any earlier expiry.
+///
+/// Covers every entry point in this module and the word parsing the program
+/// grammar does through them. While one is armed, [`parse`] bypasses its
+/// process-wide cache, so a result cut short by the deadline is never served
+/// to a later caller.
+pub fn set_parse_deadline(deadline: Option<std::time::Instant>) {
+    PARSE_DEADLINE.set(deadline);
+    PARSE_DEADLINE_EXPIRED.set(false);
+    PARSE_DEADLINE_TICKS.set(0);
+}
+
+/// Whether this thread's deadline passed during a parse since it was armed.
+/// Anything parsed once this is true may be incomplete or wrong.
+#[must_use]
+pub fn parse_deadline_expired() -> bool {
+    PARSE_DEADLINE_EXPIRED.get()
+}
+
+/// Whether a checking rule may proceed. The clock is read once every 64
+/// calls, since a rule entry is far cheaper than a clock read; what runs
+/// between two reads is bounded by the linear scans of the rules it entered.
+fn parse_in_time() -> bool {
+    if PARSE_DEADLINE_EXPIRED.get() {
+        return false;
+    }
+    let Some(deadline) = PARSE_DEADLINE.get() else {
+        return true;
+    };
+    let ticks = PARSE_DEADLINE_TICKS.get().wrapping_add(1);
+    PARSE_DEADLINE_TICKS.set(ticks);
+    if !ticks.is_multiple_of(64) || std::time::Instant::now() < deadline {
+        return true;
+    }
+    PARSE_DEADLINE_EXPIRED.set(true);
+    false
+}
+
 /// Parse a word into its constituent pieces.
 ///
 /// # Arguments
@@ -531,6 +596,9 @@ pub fn parse(
     word: &str,
     options: &ParserOptions,
 ) -> Result<Vec<WordPieceWithSource>, error::WordParseError> {
+    if PARSE_DEADLINE.get().is_some() {
+        return uncached_parse(word, options);
+    }
     cacheable_parse(word, options)
 }
 
@@ -540,6 +608,13 @@ pub fn parse(
     convert = r#"{ (word.to_owned(), options.to_owned()) }"#
 )]
 fn cacheable_parse(
+    word: &str,
+    options: &ParserOptions,
+) -> Result<Vec<WordPieceWithSource>, error::WordParseError> {
+    uncached_parse(word, options)
+}
+
+fn uncached_parse(
     word: &str,
     options: &ParserOptions,
 ) -> Result<Vec<WordPieceWithSource>, error::WordParseError> {
@@ -833,6 +908,7 @@ peg::parser! {
         // we reach the provided stop condition, which typically denotes the end of the containing
         // arithmetic expression.
         rule arithmetic_word_piece<T>(stop_condition: rule<T>) =
+            in_time() (
             // This branch matches a parenthesized piece; we consume the opening parenthesis and
             // delegate the rest to a helper rule. We don't worry about the stop condition passed
             // into us, because if we see an opening parenthesis then we *must* find its closing
@@ -845,6 +921,7 @@ peg::parser! {
             // either the overall stop condition *OR* an opening parenthesis. We add this latter
             // condition to ensure that *we* handle matching parentheses.
             !"(" word_piece(<param_rule_or_open_paren(<stop_condition()>)>, false /*in_command*/) {}
+            )
 
         // This is a helper rule that matches either the provided stop condition or an opening parenthesis.
         rule param_rule_or_open_paren<T>(stop_condition: rule<T>) -> () =
@@ -862,6 +939,7 @@ peg::parser! {
             }
 
         rule word_piece<T>(stop_condition: rule<T>, in_command: bool) -> WordPiece =
+            in_time() v:(
             // Rules that match quoted text.
             s:double_quoted_sequence() { WordPiece::DoubleQuotedSequence(s) } /
             s:single_quoted_literal_text() { WordPiece::SingleQuotedText(s.to_owned()) } /
@@ -875,6 +953,7 @@ peg::parser! {
             enabled_tilde_expr_after_colon() /
             // Finally, match unquoted literal text.
             unquoted_literal_text(<stop_condition()>, in_command)
+            ) { v }
 
         #[cache]
         rule dollar_sign_word_piece() -> WordPiece =
@@ -920,12 +999,25 @@ peg::parser! {
 
         // TODO(parser): Find a way to remove the special-case logic for extglob + subshell commands
         rule unquoted_literal_text_piece<T>(stop_condition: rule<T>, in_command: bool) =
+            in_time() (
             is_true(in_command) extglob_pattern() /
             is_true(in_command) subshell_command() /
             !stop_condition() !normal_escape_sequence() !enabled_tilde_expr_after_colon() [^'\'' | '\"' | '$' | '`'] {}
+            )
 
         rule enabled_tilde_expr_after_colon() -> WordPiece =
             tilde_exprs_after_colon_enabled() last_char_is_colon() piece:tilde_expression_piece() { piece }
+
+        // Fails once this thread's parse deadline has passed. See
+        // `set_parse_deadline`. Placed at the entry of every rule a loop or a
+        // recursion in this grammar passes through.
+        rule in_time() = #{|_input, pos| {
+            if parse_in_time() {
+                peg::RuleResult::Matched(pos, ())
+            } else {
+                peg::RuleResult::Failed
+            }
+        }}
 
         rule last_char_is_colon() = #{|input, pos| {
             if pos == 0 {
@@ -991,12 +1083,14 @@ peg::parser! {
             }
 
         rule heredoc_word_piece() -> WordPiece =
+            in_time() v:(
             arithmetic_expansion() /
             legacy_arithmetic_expansion() /
             command_substitution() /
             parameter_expansion() /
             heredoc_escape_sequence() /
             heredoc_literal_text()
+            ) { v }
 
         rule heredoc_escape_sequence() -> WordPiece =
             s:$("\\" ['$' | '`' | '\\']) { WordPiece::EscapeSequence(s.to_owned()) }
@@ -1170,6 +1264,7 @@ peg::parser! {
 
         // N.B. The indexing syntax is not a standard sh-ism.
         pub(crate) rule parameter() -> Parameter =
+            in_time() v:(
             p:positional_parameter() { Parameter::Positional(p) } /
             p:special_parameter() { Parameter::Special(p) } /
             non_posix_extensions_enabled() p:variable_name() "[@]" { Parameter::NamedWithAllIndices { name: p.to_owned(), concatenate: false } } /
@@ -1178,6 +1273,7 @@ peg::parser! {
                 Ok(Parameter::NamedWithIndex { name: p.to_owned(), index: index.to_owned() })
             } /
             p:variable_name() { Parameter::Named(p.to_owned()) }
+            ) { v }
 
         rule positional_parameter() -> u32 =
             n:$(['1'..='9'](['0'..='9']*)) {? n.parse().or(Err("u32")) }
@@ -1214,9 +1310,11 @@ peg::parser! {
             chars:(backquoted_char()*) { chars.into_iter().collect() }
 
         rule backquoted_char() -> &'input str =
+            in_time() v:(
             "\\`" { "`" } /
             "\\\\" { "\\\\" } /
             s:$([^'`']) { s }
+            ) { v }
 
         #[cache]
         rule arithmetic_expansion() -> WordPiece =
@@ -1285,7 +1383,9 @@ peg::parser! {
             }
 
         rule array_element_name() -> (&'input str, &'input str) =
+            in_time() v:(
             name:assigned_scalar_name() "[" ai:array_index() "]" { (name, ai) }
+            ) { v }
 
         rule array_index() -> &'input str =
             $(arithmetic_word(<"]">))
@@ -1369,6 +1469,77 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "took {elapsed:?}"
         );
+    }
+
+    /// Runs `f` on a thread of its own, with a large stack: this grammar's
+    /// depth is unbounded, and a debug build's frames overflow the 2 MiB test
+    /// thread on the hostile shapes below. The deadline is per thread, so this
+    /// also keeps one test's deadline out of another's.
+    fn on_own_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// A deadline that has already passed stops a parse and says so, and
+    /// disarming it restores the grammar.
+    #[test]
+    fn an_expired_deadline_stops_the_parse_and_says_so() {
+        on_own_thread(|| {
+            let word = "a".repeat(1_000);
+            super::set_parse_deadline(Some(std::time::Instant::now()));
+            let _ = super::parse(&word, &ParserOptions::default());
+            assert!(super::parse_deadline_expired());
+
+            super::set_parse_deadline(None);
+            assert!(!super::parse_deadline_expired());
+            assert!(super::parse(&word, &ParserOptions::default()).is_ok());
+        });
+    }
+
+    /// A result cut short by the deadline is never cached for a later caller.
+    #[test]
+    fn a_parse_under_a_deadline_bypasses_the_cache() {
+        on_own_thread(|| {
+            let word = format!("$(echo {})", "b".repeat(2_000));
+            super::set_parse_deadline(Some(std::time::Instant::now()));
+            let cut = super::parse(&word, &ParserOptions::default());
+            assert!(super::parse_deadline_expired());
+            super::set_parse_deadline(None);
+            let whole = super::parse(&word, &ParserOptions::default()).unwrap();
+            assert!(cut.map_or(true, |pieces| pieces != whole));
+            assert!(matches!(whole[0].piece, WordPiece::CommandSubstitution(_)));
+        });
+    }
+
+    /// The shapes memoizing leaves quadratic, and the ones it does not reach,
+    /// return near the deadline rather than seconds later
+    /// (ferentin-net/ferentin-endpoint#820). Unarmed, each of these takes from
+    /// half a second to several at this size in release.
+    #[test]
+    fn hostile_words_return_near_the_deadline() {
+        let n = 4_000;
+        let heredoc = |body: String| format!("$(cat <<EOF\n{body}\nEOF\n)");
+        let words = [
+            heredoc("$((".repeat(n)),
+            heredoc("${x-$((\"$(@(".repeat(n / 4)),
+            format!("${{x[{}}}", "a[".repeat(n)),
+            format!("x[{}", heredoc("$((".repeat(n))),
+        ];
+        for word in words {
+            let (elapsed, expired) = on_own_thread(move || {
+                let started = std::time::Instant::now();
+                super::set_parse_deadline(Some(started + std::time::Duration::from_millis(50)));
+                let _ = super::parse(&word, &ParserOptions::default());
+                let _ = super::parse_scalar_assignment(&word, &ParserOptions::default());
+                (started.elapsed(), super::parse_deadline_expired())
+            });
+            assert!(expired, "{elapsed:?}");
+            assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+        }
     }
 
     #[test]
