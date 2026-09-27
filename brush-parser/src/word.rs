@@ -545,19 +545,31 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static PARSE_DEADLINE_EXPIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PARSE_DEADLINE_TICKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    // What `parse` has finished in time since the deadline was armed. Stands in
+    // for the process-wide cache, which an armed parse must not write to, so a
+    // caller that parses the same word more than once still pays once. Cleared
+    // whenever a deadline is armed, so nothing crosses from one caller's
+    // deadline into the next's.
+    static PARSE_DEADLINE_CACHE: std::cell::RefCell<Vec<(String, ParserOptions, Vec<WordPieceWithSource>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
+
+/// How many words the armed-path cache holds, like the process-wide one.
+const PARSE_DEADLINE_CACHE_ENTRIES: usize = 64;
 
 /// Arms (or, with `None`, disarms) a deadline for word parsing on this thread,
 /// and clears any earlier expiry.
 ///
 /// Covers every entry point in this module and the word parsing the program
-/// grammar does through them. While one is armed, [`parse`] bypasses its
-/// process-wide cache, so a result cut short by the deadline is never served
-/// to a later caller.
+/// grammar does through them. While one is armed, [`parse`] neither reads nor
+/// writes its process-wide cache. It keeps a cache of its own for this thread,
+/// holding only what finished in time, so a result cut short by the deadline
+/// is never served to anyone.
 pub fn set_parse_deadline(deadline: Option<std::time::Instant>) {
     PARSE_DEADLINE.set(deadline);
     PARSE_DEADLINE_EXPIRED.set(false);
     PARSE_DEADLINE_TICKS.set(0);
+    PARSE_DEADLINE_CACHE.with_borrow_mut(Vec::clear);
 }
 
 /// Whether this thread's deadline passed during a parse since it was armed.
@@ -596,10 +608,30 @@ pub fn parse(
     word: &str,
     options: &ParserOptions,
 ) -> Result<Vec<WordPieceWithSource>, error::WordParseError> {
-    if PARSE_DEADLINE.get().is_some() {
-        return uncached_parse(word, options);
+    if PARSE_DEADLINE.get().is_none() {
+        return cacheable_parse(word, options);
     }
-    cacheable_parse(word, options)
+    let hit = PARSE_DEADLINE_CACHE.with_borrow(|cache| {
+        cache
+            .iter()
+            .find(|(cached, cached_options, _)| cached == word && cached_options == options)
+            .map(|(_, _, pieces)| pieces.clone())
+    });
+    if let Some(pieces) = hit {
+        return Ok(pieces);
+    }
+    let parsed = uncached_parse(word, options);
+    if let Ok(pieces) = &parsed
+        && !parse_deadline_expired()
+    {
+        PARSE_DEADLINE_CACHE.with_borrow_mut(|cache| {
+            if cache.len() == PARSE_DEADLINE_CACHE_ENTRIES {
+                cache.remove(0);
+            }
+            cache.push((word.to_owned(), options.clone(), pieces.clone()));
+        });
+    }
+    parsed
 }
 
 #[cached::macros::cached(
@@ -1500,7 +1532,8 @@ mod tests {
         });
     }
 
-    /// A result cut short by the deadline is never cached for a later caller.
+    /// A result cut short by the deadline is never cached for a later caller,
+    /// armed or not.
     #[test]
     fn a_parse_under_a_deadline_bypasses_the_cache() {
         on_own_thread(|| {
