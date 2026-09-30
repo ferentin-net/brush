@@ -255,13 +255,10 @@ pub(crate) fn parse_compound_assignment_value(
     let tokens = parser.tokenize().ok()?;
     let tokens = Tokens { tokens: &tokens };
     // A fresh tracker per parse, as with every other entry point into the
-    // grammar: this one is reached from the expansion path rather than from
-    // `parse_tokens`, so it needs its own descent bounded too. The signature
-    // has no error channel, so an over-deep value declines to `None`, which is
-    // what a value this function considers ill-formed already yields.
+    // grammar. The signature has no error channel, so an over-deep value
+    // declines to `None`, which is what an ill-formed value already yields.
     let nesting = peg::NestingTracker::new();
-    let elements =
-        peg::token_parser::compound_assignment_value(&tokens, options, &nesting).ok()?;
+    let elements = peg::token_parser::compound_assignment_value(&tokens, options, &nesting).ok()?;
     Some(elements.into_iter().cloned().collect())
 }
 

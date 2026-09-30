@@ -279,3 +279,16 @@ fn parse_extended_test_arith_greater_than() -> Result<()> {
     });
     Ok(())
 }
+
+// N.B. A `!` with nothing after it to negate is the string `!`, so this is the negation of
+// a test that `!` is non-empty, and-ed with `x`.
+#[test]
+fn parse_extended_test_not_of_bang_word() -> Result<()> {
+    let input = "[[ ! ! && x ]]";
+    let result = test_with_snapshot(input)?;
+    assert_snapshot_redacted!(ParseResult {
+        input,
+        result: &result
+    });
+    Ok(())
+}

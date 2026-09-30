@@ -16,10 +16,11 @@ use super::{ParserOptions, Tokens};
 /// a short command line overflows the stack, and a stack overflow *aborts* the
 /// process rather than unwinding, so no caller can catch it after the fact.
 ///
-/// The worst-observed shape costs roughly 18 KB of stack per level in an
-/// unoptimized build, which put the abort between 110 and 120 levels deep on a
-/// 2 MB thread stack. This limit keeps the descent to well under a megabyte even
-/// there, while staying far above the nesting any plausible script uses. It is
+/// The costliest shapes -- nested `case`, `for` and `if` -- take roughly 17 to 19 KB
+/// of stack per level in an unoptimized build, which puts the abort between 103 and
+/// 118 levels deep on a 2 MB thread stack. This limit keeps the descent to well
+/// under a megabyte even there, while staying far above the nesting any plausible
+/// script uses. It is
 /// deliberately independent of the tokenizer's [`MAX_EXPANSION_NESTING`]: that
 /// one bounds nesting *within* a token, this one bounds nesting *between* them.
 ///
@@ -231,6 +232,11 @@ peg::parser! {
             // command instead.
             !arithmetic_end() !specific_operator(")") [_] {}
 
+        // The tokenizer reads `;;` as a single operator, so in the header of an arithmetic for
+        // loop, an expression must also stop in front of `;;`.
+        rule arithmetic_for_expression() -> ast::UnexpandedArithmeticExpr =
+            raw_expr:$((!specific_operator(";;") arithmetic_expression_piece())*) { ast::UnexpandedArithmeticExpr { value: raw_expr } }
+
         rule parenthesized_arithmetic_pieces() -> () =
             (!specific_operator(")") arithmetic_expression_piece())* {}
 
@@ -282,9 +288,9 @@ peg::parser! {
         rule arithmetic_for_clause() -> ast::ArithmeticForClauseCommand =
             s:specific_word("for")
             specific_operator("(") specific_operator("(")
-                initializer:arithmetic_expression()? specific_operator(";")
-                condition:arithmetic_expression()? specific_operator(";")
-                updater:arithmetic_expression()?
+                initializer:arithmetic_for_expression()?
+                condition:arithmetic_for_condition()
+                updater:arithmetic_for_expression()?
             specific_operator(")") specific_operator(")")
             body:arithmetic_for_body() {
                 let start = s.location();
@@ -292,6 +298,13 @@ peg::parser! {
                 let loc = SourceSpan::within(start, end);
                 ast::ArithmeticForClauseCommand { initializer, condition, updater, body, loc }
             }
+
+        // The condition of an arithmetic for loop, along with the `;` on each side of it. When the
+        // condition is empty and there is no space between the semicolons, the tokenizer has
+        // already combined them into a single `;;` operator.
+        rule arithmetic_for_condition() -> Option<ast::UnexpandedArithmeticExpr> =
+            specific_operator(";") condition:arithmetic_expression()? specific_operator(";") { condition } /
+            specific_operator(";;") { Some(ast::UnexpandedArithmeticExpr { value: String::new() }) }
 
         rule arithmetic_for_body() -> ast::DoGroupCommand =
             sequential_sep()? body:do_group() { body } /
@@ -358,8 +371,22 @@ peg::parser! {
                 }
             }
 
+        // N.B. A `!` with nothing after it to negate is the string `!` instead, as the
+        // second `!` of `[[ ! ! && x ]]` is. The run cannot backtrack a `!` into a word
+        // the way the recursion it replaces could, so it declines that `!` up front. It
+        // declines by failing rather than through a negative lookahead so the failure is
+        // reported where the recursion reported it, at the token after the `!`.
         rule extended_test_negation() -> () =
-            specific_word("!") linebreak()
+            specific_word("!") linebreak() end:(&extended_test_operand_end())? {?
+                if end.is_some() { Err("operand") } else { Ok(()) }
+            }
+
+        // Tokens that end an operand, so cannot begin one.
+        rule extended_test_operand_end() -> () =
+            specific_operator(")") {} /
+            specific_operator("&&") {} /
+            specific_operator("||") {} /
+            ![_] {}
 
         rule extended_test_binary_predicate() -> ast::ExtendedTestExpr =
             // Arithmetic operators
@@ -457,35 +484,34 @@ peg::parser! {
             }
 
         pub(crate) rule case_item_ns() -> ast::CaseItem =
-            s:specific_operator("(")? p:pattern() specific_operator(")") c:compound_list() {
+            b:case_item_body() linebreak() {
+                let (s, p, e, c) = b;
                 let start = s.map(Token::location).or_else(|| p.first().and_then(|w| w.loc.as_ref()));
-                let end = c.location();
+                let loc = match &c {
+                    Some(c) => maybe_location(start, c.location().as_ref()),
+                    None => maybe_location(start, Some(e.location())),
+                };
 
-                let loc = maybe_location(start, end.as_ref());
-
-                ast::CaseItem { patterns: p, cmd: Some(c), post_action: ast::CaseItemPostAction::ExitCase, loc }
-            } /
-            s:specific_operator("(")? p:pattern() e:specific_operator(")") linebreak() {
-                let start = s.map(Token::location).or_else(|| p.first().and_then(|w| w.loc.as_ref()));
-                let end = Some(e.location());
-
-                let loc = maybe_location(start, end);
-                ast::CaseItem { patterns: p, cmd: None, post_action: ast::CaseItemPostAction::ExitCase, loc }
+                ast::CaseItem { patterns: p, cmd: c, post_action: ast::CaseItemPostAction::ExitCase, loc }
             }
 
         pub(crate) rule case_item() -> ast::CaseItem =
-            s:specific_operator("(")? p:pattern() specific_operator(")") linebreak() post_action:case_item_post_action() linebreak() {
+            b:case_item_body() linebreak() post_action:case_item_post_action() linebreak() {
+                let (s, p, _, c) = b;
                 let start = s.map(Token::location).or_else(|| p.first().and_then(|w| w.loc.as_ref()));
                 let end = Some(post_action.1);
                 let loc = maybe_location(start, end);
-                ast::CaseItem { patterns: p, cmd: None, post_action: post_action.0, loc }
-            } /
-            s:specific_operator("(")? p:pattern() specific_operator(")") c:compound_list() post_action:case_item_post_action() linebreak() {
-                let start = s.map(Token::location).or_else(|| p.first().and_then(|w| w.loc.as_ref()));
-                let end = Some(post_action.1);
-                let loc = maybe_location(start, end);
-                ast::CaseItem { patterns: p, cmd: Some(c), post_action: post_action.0, loc }
+                ast::CaseItem { patterns: p, cmd: c, post_action: post_action.0, loc }
             }
+
+        // N.B. Cached because `case_clause` tries each item as `case_item` and then, if no
+        // terminator follows, as `case_item_ns`, and both begin with this. Without the
+        // cache the item's commands are parsed twice whenever the terminator is missing,
+        // and a nested `case` inside those commands does the same, so the work doubles
+        // with every level of nesting.
+        #[cache]
+        rule case_item_body() -> (Option<&'input Token>, Vec<ast::Word>, &'input Token, Option<ast::CompoundList>) =
+            s:specific_operator("(")? p:pattern() e:specific_operator(")") c:compound_list()? { (s, p, e, c) }
 
         rule case_item_post_action() -> (ast::CaseItemPostAction, &'input SourceSpan)  =
             s:specific_operator(";;") {

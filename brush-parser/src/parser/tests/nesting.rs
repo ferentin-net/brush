@@ -11,9 +11,22 @@ use crate::error::ParseError;
 use crate::parser::peg::MAX_GRAMMAR_NESTING;
 use crate::parser::{Parser, ParserOptions};
 
+/// Parses `input` on a thread of its own, failing the test if that has not returned within a few
+/// seconds. Being declined is not enough: a bound that is hit and then backtracked around can turn
+/// the descent it stopped into exponential time, so each of these inputs has to be declined
+/// promptly too.
+#[allow(clippy::expect_used, clippy::unwrap_in_result)]
 fn parse(input: &str) -> Result<Program, ParseError> {
-    let options = ParserOptions::default();
-    Parser::new(std::io::Cursor::new(input), &options).parse_program()
+    let input = input.to_owned();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let options = ParserOptions::default();
+        let result = Parser::new(std::io::Cursor::new(input), &options).parse_program();
+        let _ = sender.send(result);
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("parse did not return within 10 seconds")
 }
 
 /// Returns labeled inputs that nest each recursive construct `depth` levels deep.
@@ -37,6 +50,46 @@ fn nested_inputs(depth: usize) -> Vec<(&'static str, String)> {
                 "{} true {}",
                 "while true; do ".repeat(depth),
                 "; done".repeat(depth)
+            ),
+        ),
+        (
+            "until clauses",
+            format!(
+                "{} true {}",
+                "until false; do ".repeat(depth),
+                "; done".repeat(depth)
+            ),
+        ),
+        (
+            "for clauses",
+            format!(
+                "{} true {}",
+                "for x in a; do ".repeat(depth),
+                "; done".repeat(depth)
+            ),
+        ),
+        (
+            "arithmetic for bodies",
+            format!(
+                "{} true {}",
+                "for ((;;)) do ".repeat(depth),
+                "; done".repeat(depth)
+            ),
+        ),
+        (
+            "arithmetic for headers",
+            format!(
+                "for (( {} 1 {} ; ; )) do true; done",
+                "( ".repeat(depth),
+                ") ".repeat(depth)
+            ),
+        ),
+        (
+            "case clauses",
+            format!(
+                "{} true {}",
+                "case x in x) ".repeat(depth),
+                " ;; esac".repeat(depth)
             ),
         ),
         ("coprocesses", format!("{}true", "coproc ".repeat(depth))),

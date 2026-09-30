@@ -524,12 +524,12 @@ pub enum BraceExpressionMember {
 // A deadline on the word grammar, for callers parsing untrusted words
 // (ferentin-net/ferentin-endpoint#820).
 //
-// Memoizing the rules an opener is tried through took the cost of n unmatched
-// openers from exponential to quadratic, but the grammar is reached from more
-// places than a caller can count openers at: the token grammar's assignment
-// check runs it on every word, `${x[a[a[` re-parses its subscript in every
-// parameter-expression alternative, and a caller that re-reads a word's parts
-// pays again each time. A deadline bounds all of them at once, because every
+// Several shapes still cost more than linear time, and the grammar is reached
+// from more places than a caller can count them at: the token grammar's
+// assignment check runs it on every word, `${x[a[a[` re-parses its subscript in
+// every parameter-expression alternative, unmatched `{` cost about 2^n through
+// `!brace_expr()`, and a caller that re-reads a word's parts pays again each
+// time. A deadline bounds all of them at once, because every
 // loop and every recursion in this grammar passes through one of the rules that
 // check it: `word_piece`, `arithmetic_word_piece`, `unquoted_literal_text_piece`,
 // `parameter`, `array_element_name`, `heredoc_word_piece`, `backquoted_char`
@@ -537,6 +537,9 @@ pub enum BraceExpressionMember {
 //
 // It does not cover the tokenizer or the program grammar, which run before or
 // around this one and are bounded by the caller's own limits on their input.
+// That includes the tokenizer calls this grammar makes itself, to find the end
+// of a `$(...)` or `$[...]` body; each is a single scan, bounded by the
+// tokenizer's own nesting limit.
 //
 // Per thread, and unarmed by default, so a caller that never sets one gets the
 // grammar exactly as it was. Once the deadline passes every checking rule
@@ -844,7 +847,7 @@ peg::parser! {
         pub(crate) rule unexpanded_word() -> Vec<WordPieceWithSource> = traced(<word(<![_]>)>)
 
         rule word<T>(stop_condition: rule<T>) -> Vec<WordPieceWithSource> =
-            tilde:tilde_expr_prefix_with_source()? pieces:word_piece_with_source(<stop_condition()>, false /*in_command*/)* {
+            tilde:tilde_expr_prefix_with_source()? pieces:word_piece_with_source(<stop_condition()>)* {
                 let mut all_pieces = Vec::new();
                 if let Some(tilde) = tilde {
                     all_pieces.push(tilde);
@@ -868,7 +871,7 @@ peg::parser! {
 
         // Parses text that is not considered to contain a brace expression.
         rule non_brace_expr_text<T>(stop_condition: rule<T>) -> () =
-            !"{" word_piece(<['{'] {} / stop_condition() {}>, false) {} /
+            !"{" word_piece(<['{'] {} / stop_condition() {}>) {} /
             !brace_expr() !stop_condition() "{" {}
 
         // Parses a complete brace expression, with no prefix or suffix.
@@ -951,13 +954,13 @@ peg::parser! {
             // into us, because if we see an opening parenthesis then we *must* find its closing
             // partner.
             "(" arithmetic_word_plus_right_paren() {} /
-            // This branch handles the case where we have an array element name with square brackets,
-            // which may (legitimately) contain the stop condition.
+            // An array subscript may contain the stop condition. Other brackets are left
+            // as text, so malformed arithmetic doesn't fall back to command substitution.
             array_element_name() {} /
             // This branch matches any standard piece of a word, stopping as soon as we reach
             // either the overall stop condition *OR* an opening parenthesis. We add this latter
             // condition to ensure that *we* handle matching parentheses.
-            !"(" word_piece(<param_rule_or_open_paren(<stop_condition()>)>, false /*in_command*/) {}
+            !"(" word_piece(<param_rule_or_open_paren(<stop_condition()>)>) {}
             )
 
         // This is a helper rule that matches either the provided stop condition or an opening parenthesis.
@@ -966,16 +969,15 @@ peg::parser! {
             "(" {}
 
         // This rule matches an arithmetic word followed by a right parenthesis. It must consume the right parenthesis.
-        #[cache]
         rule arithmetic_word_plus_right_paren() =
             arithmetic_word(<[')']>) ")"
 
-        rule word_piece_with_source<T>(stop_condition: rule<T>, in_command: bool) -> WordPieceWithSource =
-            start_index:position!() piece:word_piece(<stop_condition()>, in_command) end_index:position!() {
+        rule word_piece_with_source<T>(stop_condition: rule<T>) -> WordPieceWithSource =
+            start_index:position!() piece:word_piece(<stop_condition()>) end_index:position!() {
                 WordPieceWithSource { piece, start_index, end_index }
             }
 
-        rule word_piece<T>(stop_condition: rule<T>, in_command: bool) -> WordPiece =
+        rule word_piece<T>(stop_condition: rule<T>) -> WordPiece =
             in_time() v:(
             // Rules that match quoted text.
             s:double_quoted_sequence() { WordPiece::DoubleQuotedSequence(s) } /
@@ -989,17 +991,15 @@ peg::parser! {
             // Allow tilde expression to be matched as a word piece (for tilde-after-colon expansion)
             enabled_tilde_expr_after_colon() /
             // Finally, match unquoted literal text.
-            unquoted_literal_text(<stop_condition()>, in_command)
+            unquoted_literal_text(<stop_condition()>)
             ) { v }
 
-        #[cache]
         rule dollar_sign_word_piece() -> WordPiece =
             arithmetic_expansion() /
             legacy_arithmetic_expansion() /
             command_substitution() /
             parameter_expansion()
 
-        #[cache]
         rule double_quoted_word_piece() -> WordPiece =
             arithmetic_expansion() /
             legacy_arithmetic_expansion() /
@@ -1008,11 +1008,9 @@ peg::parser! {
             double_quoted_escape_sequence() /
             double_quoted_text()
 
-        #[cache]
         rule double_quoted_sequence() -> Vec<WordPieceWithSource> =
             "\"" i:double_quoted_sequence_inner()* "\"" { i }
 
-        #[cache]
         rule gettext_double_quoted_sequence() -> Vec<WordPieceWithSource> =
             "$\"" i:double_quoted_sequence_inner()* "\"" { i }
 
@@ -1031,30 +1029,16 @@ peg::parser! {
         rule ansi_c_quoted_text() -> &'input str =
             r"$'" inner:$((r"\\" / r"\'" / [^'\''])*) r"'" { inner }
 
-        rule unquoted_literal_text<T>(stop_condition: rule<T>, in_command: bool) -> WordPiece =
-            s:$(unquoted_literal_text_piece(<stop_condition()>, in_command)+) { WordPiece::Text(s.to_owned()) }
+        rule unquoted_literal_text<T>(stop_condition: rule<T>) -> WordPiece =
+            s:$(unquoted_literal_text_piece(<stop_condition()>)+) { WordPiece::Text(s.to_owned()) }
 
-        // TODO(parser): Find a way to remove the special-case logic for extglob + subshell commands
-        rule unquoted_literal_text_piece<T>(stop_condition: rule<T>, in_command: bool) =
+        rule unquoted_literal_text_piece<T>(stop_condition: rule<T>) =
             in_time() (
-            is_true(in_command) extglob_pattern() /
-            is_true(in_command) subshell_command() /
             !stop_condition() !normal_escape_sequence() !enabled_tilde_expr_after_colon() [^'\'' | '\"' | '$' | '`'] {}
             )
 
         rule enabled_tilde_expr_after_colon() -> WordPiece =
             tilde_exprs_after_colon_enabled() last_char_is_colon() piece:tilde_expression_piece() { piece }
-
-        // Fails once this thread's parse deadline has passed. See
-        // `set_parse_deadline`. Placed at the entry of every rule a loop or a
-        // recursion in this grammar passes through.
-        rule in_time() = #{|_input, pos| {
-            if parse_in_time() {
-                peg::RuleResult::Matched(pos, ())
-            } else {
-                peg::RuleResult::Failed
-            }
-        }}
 
         rule last_char_is_colon() = #{|input, pos| {
             if pos == 0 {
@@ -1070,42 +1054,22 @@ peg::parser! {
             }
         }}
 
-        rule is_true(value: bool) = &[_] {? if value { Ok(()) } else { Err("not true") } }
-
-        #[cache]
-        rule extglob_pattern() =
-            ("@" / "!" / "?" / "+" / "*") "(" extglob_body_piece()* ")" {}
-
-        rule extglob_body_piece() =
-            word_piece(<[')']>, true /*in_command*/) {}
-
-        // `#[cache]` here and on every rule an opener is tried through before a
-        // literal fallback (ferentin-net/ferentin-endpoint#820): this,
-        // `extglob_pattern`, `arithmetic_word_plus_right_paren`,
-        // `dollar_sign_word_piece`, `double_quoted_word_piece`, both quoted
-        // sequences, `parameter_expansion`, `command_substitution`, both
-        // arithmetic expansions and `parameter_expression_word`.
-        //
-        // Each is tried at an opener, and when it fails the opener is taken as
-        // literal text and the next one is tried again from scratch, so n
-        // unmatched openers cost about 2^n (3^n for `@(`, and worse for `$((`).
-        // A heredoc body is opaque to the tokenizer, so `$(cat <<EOF` and 23
-        // `(` took a second and nothing upstream stopped it. Memoized by
-        // position, each is decided once. Every one takes no arguments, and its
-        // result depends only on the position and the grammar's options.
-        //
-        // What remains is QUADRATIC, since a failing opener still scans its body
-        // to the end: in release, 4,000 levels of `$((` take about 4 s. A caller
-        // parsing untrusted words should arm `set_parse_deadline`.
-        #[cache]
-        rule subshell_command() =
-            "(" command() ")" {}
+        // Fails once this thread's parse deadline has passed. See
+        // `set_parse_deadline`. Placed at the entry of every rule a loop or a
+        // recursion in this grammar passes through.
+        rule in_time() = #{|_input, pos| {
+            if parse_in_time() {
+                peg::RuleResult::Matched(pos, ())
+            } else {
+                peg::RuleResult::Failed
+            }
+        }}
 
         rule double_quoted_text() -> WordPiece =
             s:double_quote_body_text() { WordPiece::Text(s.to_owned()) }
 
         rule double_quote_body_text() -> &'input str =
-            $((!double_quoted_escape_sequence() !dollar_sign_word_piece() [^'\"'])+)
+            $((!double_quoted_escape_sequence() !dollar_sign_word_piece() !expansion_opener() [^'\"'])+)
 
         // Heredoc body parsing: like double-quoted content, but " and ' are literal characters.
         pub(crate) rule unexpanded_heredoc_word() -> Vec<WordPieceWithSource> =
@@ -1133,7 +1097,7 @@ peg::parser! {
             s:$("\\" ['$' | '`' | '\\']) { WordPiece::EscapeSequence(s.to_owned()) }
 
         rule heredoc_literal_text() -> WordPiece =
-            s:$((!heredoc_escape_sequence() !dollar_sign_word_piece() [^'`'])+) {
+            s:$((!heredoc_escape_sequence() !dollar_sign_word_piece() !expansion_opener() [^'`'])+) {
                 WordPiece::Text(s.to_owned())
             }
 
@@ -1178,6 +1142,9 @@ peg::parser! {
 
         // TODO(parser): Deal with fact that there may be a quoted word or escaped closing brace chars.
         // TODO(parser): Improve on how we handle a '$' not followed by a valid variable name or parameter.
+        // Cached: each `${...}` can match any of ~20 parameter expression forms, and a failure
+        // within one (e.g., an unterminated `$(`) would otherwise be re-discovered by every form
+        // at every enclosing level, taking time exponential in the nesting depth.
         #[cache]
         rule parameter_expansion() -> WordPiece =
             "${" e:parameter_expression() "}" {
@@ -1186,9 +1153,15 @@ peg::parser! {
             "$" parameter:unbraced_parameter() {
                 WordPiece::ParameterExpansion(ParameterExpr::Parameter { parameter, indirect: false })
             } /
-            "$" !['\''] {
+            !expansion_opener() "$" !['\''] {
                 WordPiece::Text("$".to_owned())
             }
+
+        // As in bash, these always start an expansion, whose end the tokenizer finds (so it
+        // always does, in a word the tokenizer accepted). If none parses, the text is malformed
+        // (e.g., unterminated, or nested too deeply), so its `$` mustn't be taken as literal text.
+        // TODO(expansion): #540: the same holds for `${`, which is still taken as text.
+        rule expansion_opener() = "$" ['(' | '[']
 
         rule parameter_expression() -> ParameterExpr =
             indirect:parameter_indirection() parameter:parameter() test_type:parameter_test_type() "-" default_value:parameter_expression_word()? {
@@ -1330,18 +1303,20 @@ peg::parser! {
         rule variable_name() -> &'input str =
             $(!['0'..='9'] ['_' | '0'..='9' | 'a'..='z' | 'A'..='Z']+)
 
-        #[cache]
         pub(crate) rule command_substitution() -> WordPiece =
-            "$(" c:command() ")" { WordPiece::CommandSubstitution(c.to_owned()) } /
+            "$(" c:command_substitution_body() ")" { WordPiece::CommandSubstitution(c.to_owned()) } /
             "`" c:backquoted_command() "`" { WordPiece::BackquotedCommandSubstitution(c) }
 
-        pub(crate) rule command() -> &'input str =
-            $(command_piece()*)
-
-        pub(crate) rule command_piece() -> () =
-            word_piece(<[')']>, true /*in_command*/) {} /
-            ([' ' | '\t'])+ {} /
-            ['\'' | '`'] {}
+        // The tokenizer already has the logic to find where the command ends (e.g., skipping
+        // over here-doc bodies), so we leverage it here. `pos` and `body.len()` are both
+        // byte offsets.
+        rule command_substitution_body() -> &'input str = #{|input, pos| {
+            let rest = input.split_at(pos).1;
+            match crate::tokenizer::command_substitution_body(rest, &parser_options.tokenizer_options()) {
+                Ok(body) => peg::RuleResult::Matched(pos + body.len(), body),
+                Err(_) => peg::RuleResult::Failed,
+            }
+        }}
 
         rule backquoted_command() -> String =
             chars:(backquoted_char()*) { chars.into_iter().collect() }
@@ -1353,13 +1328,21 @@ peg::parser! {
             s:$([^'`']) { s }
             ) { v }
 
-        #[cache]
         rule arithmetic_expansion() -> WordPiece =
             "$((" e:$(arithmetic_word(<"))">)) "))" { WordPiece::ArithmeticExpression(ast::UnexpandedArithmeticExpr { value: e.to_owned() } ) }
 
-        #[cache]
         rule legacy_arithmetic_expansion() -> WordPiece =
-            "$[" e:$(arithmetic_word(<"]">)) "]" { WordPiece::ArithmeticExpression(ast::UnexpandedArithmeticExpr { value: e.to_owned() } ) }
+            "$[" e:legacy_arithmetic_expansion_body() "]" { WordPiece::ArithmeticExpression(ast::UnexpandedArithmeticExpr { value: e.to_owned() } ) }
+
+        // Reuse the tokenizer's iterative bracket counting rather than recursively parsing
+        // each bracket in the expression. As with command substitutions, preserve the source.
+        rule legacy_arithmetic_expansion_body() -> &'input str = #{|input, pos| {
+            let rest = input.split_at(pos).1;
+            match crate::tokenizer::legacy_arithmetic_expansion_body(rest, &parser_options.tokenizer_options()) {
+                Ok(body) => peg::RuleResult::Matched(pos + body.len(), body),
+                Err(_) => peg::RuleResult::Failed,
+            }
+        }}
 
         rule substring_offset() -> ast::UnexpandedArithmeticExpr =
             s:$(arithmetic_word(<[':' | '}']>)) { ast::UnexpandedArithmeticExpr { value: s.to_owned() } }
@@ -1373,7 +1356,6 @@ peg::parser! {
         rule parameter_search_pattern() -> String =
             s:$(word(<['}' | '/']>)) { s.to_owned() }
 
-        #[cache]
         rule parameter_expression_word() -> String =
             s:$(word(<['}']>)) { s.to_owned() }
 
@@ -1463,51 +1445,6 @@ mod tests {
         })
     }
 
-    /// Unmatched openers cost time exponential in their number before the
-    /// rules they are tried through were memoized
-    /// (ferentin-net/ferentin-endpoint#820). At 64 each of these would not have
-    /// returned; memoized, each takes a few milliseconds in release. Most sit
-    /// in a heredoc inside `$(…)`, because that is how they reach this parser
-    /// past the tokenizer.
-    #[test]
-    fn unmatched_openers_are_parsed_in_polynomial_time() {
-        let n = 64;
-        let heredoc = |body: String| format!("$(cat <<EOF\n{body}\nEOF\n)");
-        let words = [
-            heredoc("(".repeat(n)),
-            format!("$({})", "(".repeat(n)),
-            format!("$(ls {})", "@(".repeat(n)),
-            format!("$(({}1))", "(".repeat(n)),
-            heredoc("${x-".repeat(n)),
-            heredoc("$((".repeat(n)),
-            heredoc("$[".repeat(n)),
-            heredoc("$(".repeat(n)),
-            heredoc("\"$(".repeat(n)),
-            heredoc("$\"$(".repeat(n)),
-            heredoc("${x-$((\"$(@(".repeat(n)),
-            format!("\"{}\"", "${x-\"".repeat(n)),
-        ];
-        // On a stack of its own: this grammar's DEPTH is unbounded too, and a
-        // debug build's frames overflow the 2 MiB test thread on the mixed
-        // shape. Depth is the caller's to bound; this test is about time.
-        let elapsed = std::thread::Builder::new()
-            .stack_size(256 << 20)
-            .spawn(move || {
-                let started = std::time::Instant::now();
-                for word in &words {
-                    let _ = super::parse(word, &ParserOptions::default());
-                }
-                started.elapsed()
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "took {elapsed:?}"
-        );
-    }
-
     /// Runs `f` on a thread of its own, with a large stack: this grammar's
     /// depth is unbounded, and a debug build's frames overflow the 2 MiB test
     /// thread on the hostile shapes below. The deadline is per thread, so this
@@ -1542,7 +1479,7 @@ mod tests {
     /// as arithmetic. Armed on its own, so it is not handed a spent deadline.
     #[test]
     fn the_assignment_path_returns_near_the_deadline() {
-        let word = format!("x[$(cat <<EOF\n{}1\nEOF\n)", "$((".repeat(4_000));
+        let word = format!("x[{}", "a[".repeat(4_000));
         let (elapsed, expired) = on_own_thread(move || {
             let started = std::time::Instant::now();
             super::set_parse_deadline(Some(started + std::time::Duration::from_millis(50)));
@@ -1570,33 +1507,39 @@ mod tests {
 
     /// A result cut short by the deadline is never cached for a later caller,
     /// armed or not.
+    ///
+    /// N.B. The clock is read once every 64 guarded rule entries, so the word
+    /// has to make more than that: each character of unquoted text is one. The
+    /// body of a `$(...)` is found by the tokenizer in a single step, so it
+    /// makes almost none.
     #[test]
     fn a_parse_under_a_deadline_bypasses_the_cache() {
         on_own_thread(|| {
-            let word = format!("$(echo {})", "b".repeat(2_000));
+            let word = format!("{}$(echo b)", "a".repeat(2_000));
             super::set_parse_deadline(Some(std::time::Instant::now()));
             let cut = super::parse(&word, &ParserOptions::default());
             assert!(super::parse_deadline_expired());
             super::set_parse_deadline(None);
             let whole = super::parse(&word, &ParserOptions::default()).unwrap();
             assert!(cut.map_or(true, |pieces| pieces != whole));
-            assert!(matches!(whole[0].piece, WordPiece::CommandSubstitution(_)));
+            assert!(matches!(
+                whole.last().map(|piece| &piece.piece),
+                Some(WordPiece::CommandSubstitution(_))
+            ));
         });
     }
 
-    /// The shapes memoizing leaves quadratic, and the ones it does not reach,
-    /// return near the deadline rather than seconds later
-    /// (ferentin-net/ferentin-endpoint#820). Unarmed, each of these takes from
-    /// half a second to several at this size in release.
+    /// Shapes that still cost more than linear time return near the deadline
+    /// rather than seconds later (ferentin-net/ferentin-endpoint#820). Unarmed,
+    /// each takes about a second or more at this size in release: an array
+    /// subscript re-parsed in every parameter-expression alternative, and
+    /// unterminated default values inside double quotes.
     #[test]
     fn hostile_words_return_near_the_deadline() {
         let n = 4_000;
-        let heredoc = |body: String| format!("$(cat <<EOF\n{body}\nEOF\n)");
         let words = [
-            heredoc("$((".repeat(n)),
-            heredoc("${x-$((\"$(@(".repeat(n / 4)),
             format!("${{x[{}}}", "a[".repeat(n)),
-            format!("x[{}", heredoc("$((".repeat(n))),
+            format!("\"{}\"", "${x-\"".repeat(n)),
         ];
         for word in words {
             let (elapsed, expired) = on_own_thread(move || {
@@ -1694,9 +1637,6 @@ mod tests {
 
     #[test]
     fn parse_command_substitution() -> Result<()> {
-        super::expansion_parser::command_piece("echo", &ParserOptions::default())?;
-        super::expansion_parser::command_piece("hi", &ParserOptions::default())?;
-        super::expansion_parser::command("echo hi", &ParserOptions::default())?;
         super::expansion_parser::command_substitution("$(echo hi)", &ParserOptions::default())?;
 
         assert_ron_snapshot!(test_parse("$(echo hi)")?);
@@ -1706,15 +1646,18 @@ mod tests {
 
     #[test]
     fn parse_command_substitution_with_embedded_quotes() -> Result<()> {
-        super::expansion_parser::command_piece("echo", &ParserOptions::default())?;
-        super::expansion_parser::command_piece(r#""hi""#, &ParserOptions::default())?;
-        super::expansion_parser::command(r#"echo "hi""#, &ParserOptions::default())?;
         super::expansion_parser::command_substitution(
             r#"$(echo "hi")"#,
             &ParserOptions::default(),
         )?;
 
         assert_ron_snapshot!(test_parse(r#"$(echo "hi")"#)?);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_command_substitution_with_multibyte_chars() -> Result<()> {
+        assert_ron_snapshot!(test_parse("é$(echo “ü”)ñ")?);
         Ok(())
     }
 
@@ -1781,6 +1724,119 @@ mod tests {
     #[test]
     fn parse_arithmetic_expansion_with_parens() -> Result<()> {
         assert_ron_snapshot!(test_parse("$((((1+2)*3)))")?);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_arithmetic_expansion_with_unmatched_brackets() -> Result<()> {
+        // Invalid arithmetic must stay arithmetic, rather than fall back to executing
+        // the expression as a command substitution.
+        for expr in ["echo unexpected [", "1[", "a[1", "[ ["] {
+            let word = std::format!("$(({expr}))");
+            let parsed = super::parse(&word, &ParserOptions::default())?;
+            assert_matches!(
+                parsed.as_slice(),
+                [WordPieceWithSource { piece: WordPiece::ArithmeticExpression(e), .. }] if e.value == expr,
+                "for {word:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parse_arithmetic_expansion_with_deep_brackets() -> Result<()> {
+        // Brackets in the expression must not grow the word parser's call stack.
+        // Arithmetic evaluation can reject this expression after its boundaries are found.
+        let expr = std::format!("{}1{}", "[".repeat(15_000), "]".repeat(15_000));
+        for (open, close) in [("$((", "))"), ("$[", "]")] {
+            let word = std::format!("{open}{expr}{close}");
+            let parsed = super::parse(&word, &ParserOptions::default())?;
+            assert_matches!(
+                parsed.as_slice(),
+                [WordPieceWithSource { piece: WordPiece::ArithmeticExpression(e), .. }] if e.value == expr
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parse_legacy_arithmetic_expansion_with_array_subscripts() -> Result<()> {
+        for (word, expr) in [
+            ("$[a[1]]", "a[1]"),
+            ("$[ a[1] + 1 ]", " a[1] + 1 "),
+            ("$[ a[ a[0] ] ]", " a[ a[0] ] "),
+            ("$[ a[$[1]] + $(printf 2) ]", " a[$[1]] + $(printf 2) "),
+            ("$[ 'é]' ]", " 'é]' "),
+            ("$[ \\] ]", " \\] "),
+        ] {
+            let parsed = super::parse(word, &ParserOptions::default())?;
+            assert_matches!(
+                parsed.as_slice(),
+                [WordPieceWithSource { piece: WordPiece::ArithmeticExpression(e), .. }] if e.value == expr,
+                "for {word:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parse_malformed_expansions_as_errors() {
+        // As in bash, a `$` before `(` or `[` always starts an expansion; if none parses, the
+        // text is malformed, not literal text.
+        let options = ParserOptions::default();
+        for word in ["a$(echo", "\"$(echo\"", "$((1 +", "$[1 +", "\"a $[1 + b\""] {
+            assert!(super::parse(word, &options).is_err(), "for {word:?}");
+        }
+        for body in [
+            "a $(echo hi\n",
+            "a $(echo 'b) c\n",
+            "a $((1 + b\n",
+            "a $[1 + b\n",
+        ] {
+            assert!(
+                super::parse_heredoc(body, &options).is_err(),
+                "for {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_malformed_expansions_nested_in_parameter_expansions_quickly() {
+        // Each `${...}` can match any of ~20 parameter expression forms; unless its parse is
+        // memoized, a failure within (e.g., an unterminated `$(`) is re-discovered by each form,
+        // taking time exponential in the nesting depth.
+        let options = ParserOptions::default();
+        let nested =
+            |inner: &str| std::format!("{}{inner}{}\n", "${x:-".repeat(30), "}".repeat(30));
+        assert!(super::parse_heredoc(&nested("$(echo"), &options).is_err());
+        assert!(super::parse_heredoc(&nested("$((1 +"), &options).is_err());
+        assert!(super::parse(&std::format!("\"{}\"", nested("$[1").trim_end()), &options).is_err());
+    }
+
+    #[test]
+    fn parse_lone_dollar_signs_as_text() -> Result<()> {
+        let options = ParserOptions::default();
+        for word in [
+            "$", "a$", "$ b", "$%", "\"$\"", "\"a$ b\"", "\"$'x'\"", "${x}$",
+        ] {
+            super::parse(word, &options)?;
+        }
+        super::parse_heredoc("cost: $5 $ $% \"$'x'\" a$\n", &options)?;
+        Ok(())
+    }
+
+    #[test]
+    fn parse_heredoc_with_command_substitutions_nested_too_deeply() -> Result<()> {
+        // Here-doc bodies aren't tokenized along with the script, so the word parser is the
+        // first to find nesting past the tokenizer's limit; that's an error, not literal text.
+        let nested = |depth: u32| {
+            let depth = depth as usize;
+            std::format!("{}:{}\n", "$(".repeat(depth), ")".repeat(depth))
+        };
+        let limit = crate::tokenizer::MAX_EXPANSION_NESTING;
+        let options = ParserOptions::default();
+        super::parse_heredoc(&nested(limit), &options)?;
+        assert!(super::parse_heredoc(&nested(limit + 1), &options).is_err());
         Ok(())
     }
 
