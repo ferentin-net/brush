@@ -772,9 +772,9 @@ pub(crate) fn parse_array_assignment(
     })
 }
 
-/// Parses one bound of a numeric brace sequence, e.g. `-007`.
+/// Parses one bound of a numeric brace sequence, e.g. `-007`, or its increment.
 ///
-/// Returns `None` when the bound does not fit in an `i64`, which lets the sequence
+/// Returns `None` when the number does not fit in an `i64`, which lets the sequence
 /// rule decline rather than panic on something like `{99999999999999999999..1}`.
 ///
 /// The sign goes to the parser along with the digits, so `i64::MIN` is accepted even
@@ -900,17 +900,27 @@ peg::parser! {
                 BraceExpressionMember::Child(child_pieces)
             }
 
+        // As in bash 5.3, a sequence with an increment of `i64::MIN` is left as text,
+        // whichever way it goes: its magnitude can't be taken without overflowing.
         pub(crate) rule brace_sequence_expr() -> BraceExpressionMember =
-            start:sequence_bound() ".." end:sequence_bound() increment:(".." n:number() { n })? {
-                BraceExpressionMember::NumberSequence {
-                    start: start.0,
-                    end: end.0,
-                    increment: increment.unwrap_or(1),
-                    zero_padded_width: zero_padded_width(start.1, end.1),
+            start:sequence_bound() ".." end:sequence_bound() increment:(".." n:number() { n })? {?
+                if increment == Some(i64::MIN) {
+                    Err("increment out of range")
+                } else {
+                    Ok(BraceExpressionMember::NumberSequence {
+                        start: start.0,
+                        end: end.0,
+                        increment: increment.unwrap_or(1),
+                        zero_padded_width: zero_padded_width(start.1, end.1),
+                    })
                 }
             } /
-            start:character() ".." end:character() increment:(".." n:number() { n })? {
-                BraceExpressionMember::CharSequence { start, end, increment: increment.unwrap_or(1) }
+            start:character() ".." end:character() increment:(".." n:number() { n })? {?
+                if increment == Some(i64::MIN) {
+                    Err("increment out of range")
+                } else {
+                    Ok(BraceExpressionMember::CharSequence { start, end, increment: increment.unwrap_or(1) })
+                }
             }
 
         // A bound of a numeric sequence, kept alongside the text it was written as.
@@ -920,10 +930,10 @@ peg::parser! {
             parse_sequence_bound(text).map(|n| (n, text)).ok_or("number out of range")
         }
 
-        rule number() -> i64 = sign:number_sign()? n:$(['0'..='9']+) {
-            let sign = sign.unwrap_or(1);
-            let num: i64 = n.parse().unwrap();
-            num * sign
+        // The increment of a brace sequence. One that does not fit in an `i64` makes
+        // the sequence rule decline, so the expression is left as text, as bash does.
+        rule number() -> i64 = text:$(number_sign()? ['0'..='9']+) {?
+            parse_sequence_bound(text).ok_or("number out of range")
         }
 
         rule number_sign() -> i64 =
@@ -1319,12 +1329,21 @@ peg::parser! {
         }}
 
         rule backquoted_command() -> String =
-            chars:(backquoted_char()*) { chars.into_iter().collect() }
+            chars:(backquoted_char()*) {
+                let mut command: String = chars.into_iter().collect();
+                // TODO(tokenizer): A backslash ending the input is reported as an unterminated
+                // escape, where bash takes it literally; escape it so it stays literal.
+                if command.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1 {
+                    command.push('\\');
+                }
+                command
+            }
 
+        // As in bash, a backslash is removed only before `$`, `` ` ``, or `\`. (The tokenizer
+        // already removed line continuations.)
         rule backquoted_char() -> &'input str =
             in_time() v:(
-            "\\`" { "`" } /
-            "\\\\" { "\\\\" } /
+            "\\" s:$(['$' | '`' | '\\']) { s } /
             s:$([^'`']) { s }
             ) { v }
 
@@ -1710,6 +1729,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_backquoted_command_escapes() -> Result<()> {
+        for (input, expected) in [
+            (r"`printf \\2`", r"printf \2"),
+            (r"`printf \\\\2`", r"printf \\2"),
+            (r#"`echo \$x \` \" \a`"#, r#"echo $x ` \" \a"#),
+            // A backslash left ending the command is escaped to keep it literal.
+            (r"`printf \\`", r"printf \\"),
+            (r"`printf \\\\`", r"printf \\"),
+            (r"`printf \\\\\\`", r"printf \\\\"),
+        ] {
+            let parsed = super::parse(input, &ParserOptions::default())?;
+            assert_matches!(
+                &parsed[..],
+                [WordPieceWithSource { piece: WordPiece::BackquotedCommandSubstitution(command), .. }]
+                    if command == expected,
+                "parsing {input:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn parse_extglob_with_embedded_parameter() -> Result<()> {
         assert_ron_snapshot!(test_parse("+([$var])")?);
         Ok(())
@@ -1883,6 +1924,33 @@ mod tests {
             assert_ron_snapshot!(super::parse_brace_expansions(input, &options)?.ok_or_else(
                 || anyhow::anyhow!("Expected brace expansion to be parsed successfully")
             )?);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn brace_sequence_with_out_of_range_increment_is_text() -> Result<()> {
+        let options = ParserOptions::default();
+
+        for input in [
+            "{1..5..99999999999999999999}",
+            "{1..5..-99999999999999999999}",
+            "{a..e..99999999999999999999}",
+            // No sequence steps by `i64::MIN`, whose magnitude overflows.
+            "{1..5..-9223372036854775808}",
+            "{5..1..-9223372036854775808}",
+            "{3..3..-9223372036854775808}",
+            "{a..e..-9223372036854775808}",
+            "{e..a..-9223372036854775808}",
+        ] {
+            let pieces = super::parse_brace_expansions(input, &options)?.unwrap_or_default();
+            assert!(
+                pieces
+                    .iter()
+                    .all(|piece| matches!(piece, BraceExpressionOrText::Text(_))),
+                "{input} should not parse as a brace sequence: {pieces:?}"
+            );
         }
 
         Ok(())

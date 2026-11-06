@@ -66,7 +66,7 @@ cases:
       wc -l <<EOF
       EOF
 
-  - name: "Basic here doc"
+  - name: "Single-line here doc"
     stdin: "wc -l <<EOF\nSomething\nEOF"
 
   - name: "Here doc with other tokens after tag"
@@ -174,6 +174,61 @@ cases:
       \'not unquoted\'
       EOF
 
+  - name: "Here doc line continuation"
+    stdin: |
+      cat <<EOF
+      alpha\
+      beta
+      double\\
+      backslash
+      $(echo 'single\
+      quotes') `echo back\
+      quotes`
+      EOF
+      cat <<'EOF'
+      alpha\
+      beta
+      EOF
+      cat <<\EOF
+      alpha\
+      beta $HOME
+      EOF
+      cat <<'EOF'
+      \
+      quoted body starting with a line continuation
+      EOF
+
+  - name: "Here doc backquote escape rules"
+    stdin: |
+      cat <<EOF
+      `echo \"q\"`
+      `echo \\\\z`
+      EOF
+
+  - name: "Here doc end tag joined by a line continuation"
+    stdin: |
+      cat <<EOF
+      body
+      E\
+      OF
+      echo after
+      cat <<EOF
+      body\
+      EOF
+      EOF
+
+  - name: "Here doc end tag line continued onto the next line"
+    stdin: |
+      cat <<E
+      abc
+      E\
+      X
+      E
+      echo done
+
+  - name: "Here doc line continuation with tab stripping"
+    stdin: "cat <<-EOF\n\talpha\\\n\tbeta\n\tEOF\n"
+
   - name: "Here doc with command substitution containing quotes"
     stdin: |
       cat <<EOF
@@ -196,6 +251,23 @@ cases:
       )
 
       echo "${test1}"
+
+  - name: "Here doc in a command substitution inside arithmetic"
+    stdin: |
+      echo $(( $(cat <<EOF
+      1
+      EOF
+      ) + 2 ))
+
+  - name: "Here doc body closing paren in a command substitution inside arithmetic"
+    known_failure: true # TODO(tokenizer): bash runs the body's `)` as a command, expanding `$((...))` to nothing; brush reads the body and fails to evaluate `) + 2`
+    ignore_stderr: true
+    stdin: |
+      echo $(( $(cat <<EOF
+      )
+      EOF
+      ) + 2 ))
+      echo "rc=$?"
 
   - name: "Here doc with parentheses"
     stdin: |
@@ -230,6 +302,21 @@ cases:
       cat <<'EOF'
       something
       EOF
+
+  - name: "Here doc with quoted delimiter containing backslashes and quotes"
+    stdin: |
+      cat <<'a\b'
+      single
+      a\b
+      cat <<"a\b"
+      double
+      a\b
+      cat <<"x'y"
+      mixed
+      x'y
+      cat <<a\'b
+      escaped
+      a'b
 
   - name: "Here doc with double quoted delimiter"
     stdin: |
@@ -616,7 +703,6 @@ cases:
       echo "rc=$?"
 
   - name: "Here doc tag quote removal with nested quotes and backslashes"
-    known_failure: true # TODO(tokenizer): unquote_str drops every quote char, even quoted ones, and treats a backslash in single quotes as an escape
     ignore_stderr: true
     stdin: |
       cat <<"'"

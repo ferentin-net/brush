@@ -13,7 +13,7 @@ process down or hold the thread that parses it.
 
 ## What is changed
 
-`main` is upstream `8b539dd` plus four commits, all confined to `brush-parser`
+`main` is upstream `9435534` plus four commits, all confined to `brush-parser`
 except the CI change:
 
 | Commit | What it does | Upstream |
@@ -34,6 +34,25 @@ Upstream has since fixed the rest of what this mirror used to carry:
   and #5 here memoized: upstream
   [#1407](https://github.com/reubeno/brush/pull/1407) removed that path, and
   those commits are no longer carried.
+
+The rebuild on `9435534` met two upstream changes to rules this set also
+edits, and kept both sides of each:
+
+- `extended_test_expression`: upstream `2d7c912` reads an unquoted unary
+  operator in `[[ ]]` as the operator and adds `extended_unary_operand`; the
+  recursion bound replaces the recursive `!` with a counted run. The two sit
+  side by side.
+- `backquoted_char`: upstream
+  [#1421](https://github.com/reubeno/brush/pull/1421) removes a backslash only
+  before `$`, `` ` `` or `\`; the deadline wraps the rule's alternatives in
+  `in_time()`. Upstream's alternatives are now inside that wrapper.
+
+Checked with the comparison below: on every script in
+`brush-shell/tests/cases` (3,418), every `[[ ]]` body of up to five tokens
+from `! -z -n a == =~ && || ( ) ]]` (177,155) and every backquote body of up
+to six characters from ``\ $ ` a " `` and a space, bare and inside double
+quotes (111,974), the program `Debug` and every word's `Debug` are identical
+to upstream `9435534`.
 
 ## Keeping up with upstream
 

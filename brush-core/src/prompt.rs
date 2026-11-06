@@ -80,7 +80,7 @@ fn format_prompt_piece(
         brush_parser::prompt::PromptPiece::BellCharacter => "\x07".to_owned(),
         brush_parser::prompt::PromptPiece::CarriageReturn => "\r".to_owned(),
         brush_parser::prompt::PromptPiece::CurrentCommandNumber => {
-            return error::unimp("prompt: current command number");
+            shell.command_number().to_string()
         }
         brush_parser::prompt::PromptPiece::CurrentHistoryNumber => {
             return error::unimp("prompt: current history number");
@@ -181,6 +181,7 @@ fn format_current_working_directory(
         working_dir_str = filename.to_string_lossy().to_string();
     }
 
+    // ast-grep-ignore: platform-cfg-outside-sys
     if cfg!(windows) {
         working_dir_str = working_dir_str.replace('\\', "/");
     }
